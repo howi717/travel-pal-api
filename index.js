@@ -1,9 +1,10 @@
 /* eslint-disable no-console */
 require("dotenv").config();
-
+console.log("RUNNING BACKEND VERSION 999");
 const express = require("express");
 const cors = require("cors");
 const Redis = require("ioredis");
+const LEGACY_MODE = String(process.env.LEGACY_MODE || "") === "1";
 
 const app = express();
 app.use(cors());
