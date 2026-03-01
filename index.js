@@ -8,7 +8,7 @@ const Redis = require("ioredis");
 // Google Play verify
 const { google } = require("googleapis");
 
-console.log("RUNNING BACKEND VERSION 1000");
+console.log("RUNNING BACKEND VERSION 1001");
 
 const app = express();
 app.use(cors());
@@ -294,7 +294,8 @@ app.get("/credits", async (req, res) => {
 app.post("/analyze", async (req, res) => {
   try {
     const { imageBase64 } = req.body || {};
-    if (!imageBase64) return res.status(400).json({ error: "Missing imageBase64" });
+    if (!imageBase64)
+      return res.status(400).json({ error: "Missing imageBase64" });
 
     const devBypass = isDevBypass(req);
     const userId = devBypass ? "dev_bypass" : getUserId(req);
@@ -310,13 +311,19 @@ app.post("/analyze", async (req, res) => {
       const freeKey = freeUsedKey(userId, day);
       const cKey = creditsKey(userId);
 
-      const result = await redis.eval(LUA_CONSUME_USAGE, 2, freeKey, cKey, String(FREE_LIMIT_PER_DAY));
+      const result = await redis.eval(
+        LUA_CONSUME_USAGE,
+        2,
+        freeKey,
+        cKey,
+        String(FREE_LIMIT_PER_DAY)
+      );
+
       const allowed = Number(result[0]) === 1;
       const freeUsedAfter = Number(result[2]);
       const creditsAfter = Number(result[3]);
 
-      // Ensure free-used key expires
-      // (do it best-effort; not required for correctness)
+      // Ensure free-used key expires (best-effort)
       await redis.expire(freeKey, 60 * 60 * 24 * 3).catch(() => {});
 
       const freeRemaining = Math.max(0, FREE_LIMIT_PER_DAY - freeUsedAfter);
@@ -339,21 +346,33 @@ app.post("/analyze", async (req, res) => {
       }
     }
 
-    // OpenAI schema
+    // OpenAI schema (IMPORTANT: additionalProperties: false required by OpenAI json_schema)
     const schema = {
       type: "object",
+      additionalProperties: false,
       properties: {
         landmark: {
           type: "object",
+          additionalProperties: false,
           properties: {
             name: { type: "string" },
             essentialInfo: { type: "string" },
             location: { type: "string" },
-            relatedPersons: { type: "array", items: { type: "string" } },
+            relatedPersons: {
+              type: "array",
+              items: { type: "string" },
+            },
             funFact: { type: "string" },
             kind: { type: "string" },
           },
-          required: ["name", "essentialInfo", "location", "relatedPersons", "funFact", "kind"],
+          required: [
+            "name",
+            "essentialInfo",
+            "location",
+            "relatedPersons",
+            "funFact",
+            "kind",
+          ],
         },
       },
       required: ["landmark"],
@@ -408,7 +427,9 @@ Never include header words inside field values.
     });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ error: err.message || "ANALYZE_ERROR" });
+    return res
+      .status(500)
+      .json({ error: err.message || "ANALYZE_ERROR" });
   }
 });
 
@@ -420,7 +441,8 @@ app.post("/translate", async (req, res) => {
   try {
     const userId = getUserId(req) || "anonymous";
     const { text, lang } = req.body || {};
-    if (!text || !lang) return res.status(400).json({ error: "Missing text/lang" });
+    if (!text || !lang)
+      return res.status(400).json({ error: "Missing text/lang" });
 
     const prompt = `
 Translate the following text into ${lang}.
@@ -444,7 +466,9 @@ ${text}
     return res.json({ text: out, userId });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ error: err.message || "TRANSLATE_ERROR" });
+    return res
+      .status(500)
+      .json({ error: err.message || "TRANSLATE_ERROR" });
   }
 });
 
@@ -481,8 +505,7 @@ app.post("/verify-purchase", async (req, res) => {
 
     const p = getResp.data || {};
 
-    // purchaseState: 0 Purchased, 1 Canceled, 2 Pending (common meanings)
-    // Note: exact semantics can vary; treat "pending/canceled" as not grant.
+    // purchaseState: 0 Purchased, 1 Canceled, 2 Pending
     const purchaseState = Number(p.purchaseState);
     if (purchaseState !== 0) {
       return res.status(402).json({
@@ -525,7 +548,9 @@ app.post("/verify-purchase", async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ error: err.message || "VERIFY_ERROR" });
+    return res
+      .status(500)
+      .json({ error: err.message || "VERIFY_ERROR" });
   }
 });
 
