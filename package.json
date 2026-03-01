@@ -8,6 +8,7 @@
     "cors": "^2.8.6",
     "dotenv": "^16.6.1",
     "express": "^4.22.1",
+    "googleapis": "^171.4.0",
     "ioredis": "^5.9.3"
   }
 }
