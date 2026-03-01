@@ -8,7 +8,7 @@ const Redis = require("ioredis");
 // Google Play verify
 const { google } = require("googleapis");
 
-console.log("RUNNING BACKEND VERSION 1001");
+console.log("RUNNING BACKEND VERSION 1002");
 
 const app = express();
 app.use(cors());
@@ -195,6 +195,44 @@ return {0, 0, freeUsed, credits}
 `;
 
 /**
+ * refundUsageScript:
+ * If usedFree==1 -> DECR freeUsedKey (min 0)
+ * else -> INCR creditsKey by 1
+ *
+ * KEYS:
+ * 1 = freeUsedKey
+ * 2 = creditsKey
+ *
+ * ARGV:
+ * 1 = usedFree ("1" or "0")
+ *
+ * RETURNS:
+ * [freeUsedAfter, creditsAfter]
+ */
+const LUA_REFUND_USAGE = `
+local freeKey = KEYS[1]
+local creditsKey = KEYS[2]
+local usedFree = tonumber(ARGV[1])
+
+local freeUsed = tonumber(redis.call("GET", freeKey) or "0")
+local credits = tonumber(redis.call("GET", creditsKey) or "0")
+
+if usedFree == 1 then
+  if freeUsed > 0 then
+    freeUsed = redis.call("DECR", freeKey)
+  end
+  if freeUsed < 0 then
+    redis.call("SET", freeKey, "0")
+    freeUsed = 0
+  end
+  return {freeUsed, credits}
+else
+  credits = redis.call("INCR", creditsKey)
+  return {freeUsed, credits}
+end
+`;
+
+/**
  * addCreditsIfNewPurchase:
  * Idempotency: if purchaseKey exists -> return 0 (no-op)
  * else set purchaseKey=1 with TTL and INCR credits
@@ -286,28 +324,50 @@ app.get("/credits", async (req, res) => {
 });
 
 /**
+ * DEV ONLY: reset today's free-used + credits for a user
+ * Guarded by x-dev-bypass header matching DEV_BYPASS_TOKEN
+ */
+app.post("/dev/reset-user", async (req, res) => {
+  try {
+    if (!isDevBypass(req)) return res.status(403).json({ error: "FORBIDDEN" });
+    if (!redis) return res.status(500).json({ error: "NO_REDIS" });
+
+    const { userId } = req.body || {};
+    if (!userId) return res.status(400).json({ error: "Missing userId" });
+
+    const day = utcDayKey();
+    await redis.del(freeUsedKey(userId, day));
+    await redis.set(creditsKey(userId), "0");
+
+    const status = await getCreditsStatus(userId);
+    return res.json({ ok: true, ...status });
+  } catch (e) {
+    return res.status(500).json({ error: e.message || "RESET_ERROR" });
+  }
+});
+
+/**
  * Analyze:
  * - Requires x-user-id (unless dev bypass)
  * - Atomically consumes free/credit BEFORE OpenAI call
- * - Returns data + quota status
+ * - If OpenAI fails, we refund the consumed unit.
  */
 app.post("/analyze", async (req, res) => {
+  const { imageBase64 } = req.body || {};
+  if (!imageBase64) return res.status(400).json({ error: "Missing imageBase64" });
+
+  const devBypass = isDevBypass(req);
+  const userId = devBypass ? "dev_bypass" : getUserId(req);
+  if (!userId) return res.status(400).json({ error: "Missing x-user-id" });
+  if (!redis) return res.status(500).json({ error: "NO_REDIS" });
+
+  // Track what we consumed so we can refund on error
+  let consumed = null; // { usedFree: 0/1, freeKey, creditsKey, day }
+  let quotaSnapshot = null;
+
   try {
-    const { imageBase64 } = req.body || {};
-    if (!imageBase64)
-      return res.status(400).json({ error: "Missing imageBase64" });
-
-    const devBypass = isDevBypass(req);
-    const userId = devBypass ? "dev_bypass" : getUserId(req);
-    if (!userId) return res.status(400).json({ error: "Missing x-user-id" });
-    if (!redis) return res.status(500).json({ error: "NO_REDIS" });
-
-    // Consume quota atomically (unless bypass)
-    let quotaSnapshot = null;
-
     if (!devBypass) {
       const day = utcDayKey();
-      // Set TTL for freeUsedKey so it doesn't grow forever (e.g. 3 days)
       const freeKey = freeUsedKey(userId, day);
       const cKey = creditsKey(userId);
 
@@ -320,10 +380,10 @@ app.post("/analyze", async (req, res) => {
       );
 
       const allowed = Number(result[0]) === 1;
+      const usedFree = Number(result[1]) === 1 ? 1 : 0;
       const freeUsedAfter = Number(result[2]);
       const creditsAfter = Number(result[3]);
 
-      // Ensure free-used key expires (best-effort)
       await redis.expire(freeKey, 60 * 60 * 24 * 3).catch(() => {});
 
       const freeRemaining = Math.max(0, FREE_LIMIT_PER_DAY - freeUsedAfter);
@@ -344,6 +404,8 @@ app.post("/analyze", async (req, res) => {
           ...quotaSnapshot,
         });
       }
+
+      consumed = { usedFree, freeKey, cKey, day };
     }
 
     // OpenAI schema (IMPORTANT: additionalProperties: false required by OpenAI json_schema)
@@ -358,10 +420,7 @@ app.post("/analyze", async (req, res) => {
             name: { type: "string" },
             essentialInfo: { type: "string" },
             location: { type: "string" },
-            relatedPersons: {
-              type: "array",
-              items: { type: "string" },
-            },
+            relatedPersons: { type: "array", items: { type: "string" } },
             funFact: { type: "string" },
             kind: { type: "string" },
           },
@@ -392,10 +451,7 @@ Never include header words inside field values.
           role: "user",
           content: [
             { type: "input_text", text: prompt },
-            {
-              type: "input_image",
-              image_url: `data:image/jpeg;base64,${imageBase64}`,
-            },
+            { type: "input_image", image_url: `data:image/jpeg;base64,${imageBase64}` },
           ],
         },
       ],
@@ -412,12 +468,11 @@ Never include header words inside field values.
 
     const parsed = await openaiResponsesCreate(body);
     const outputText = extractOutputText(parsed);
-    if (!outputText) return res.status(500).json({ error: "No output_text" });
+    if (!outputText) throw new Error("No output_text");
 
     const data = JSON.parse(outputText);
 
-    // If dev bypass, return actual status too if possible
-    if (!quotaSnapshot && redis && userId && userId !== "dev_bypass") {
+    if (!quotaSnapshot && !devBypass) {
       quotaSnapshot = await getCreditsStatus(userId);
     }
 
@@ -426,10 +481,29 @@ Never include header words inside field values.
       ...(quotaSnapshot || {}),
     });
   } catch (err) {
+    // Refund if we consumed something and then failed
+    try {
+      if (consumed && !devBypass) {
+        await redis.eval(
+          LUA_REFUND_USAGE,
+          2,
+          consumed.freeKey,
+          consumed.cKey,
+          String(consumed.usedFree)
+        );
+
+        // refresh snapshot after refund
+        quotaSnapshot = await getCreditsStatus(userId);
+      }
+    } catch (refundErr) {
+      console.error("REFUND ERROR:", refundErr);
+    }
+
     console.error(err);
-    return res
-      .status(500)
-      .json({ error: err.message || "ANALYZE_ERROR" });
+    return res.status(500).json({
+      error: err.message || "ANALYZE_ERROR",
+      ...(quotaSnapshot || {}),
+    });
   }
 });
 
@@ -441,8 +515,7 @@ app.post("/translate", async (req, res) => {
   try {
     const userId = getUserId(req) || "anonymous";
     const { text, lang } = req.body || {};
-    if (!text || !lang)
-      return res.status(400).json({ error: "Missing text/lang" });
+    if (!text || !lang) return res.status(400).json({ error: "Missing text/lang" });
 
     const prompt = `
 Translate the following text into ${lang}.
@@ -466,18 +539,13 @@ ${text}
     return res.json({ text: out, userId });
   } catch (err) {
     console.error(err);
-    return res
-      .status(500)
-      .json({ error: err.message || "TRANSLATE_ERROR" });
+    return res.status(500).json({ error: err.message || "TRANSLATE_ERROR" });
   }
 });
 
 /**
  * Verify purchase (topup)
  * Body: { productId, purchaseToken }
- * - Verifies with Google Play
- * - Consumes the purchase (so it can be bought again)
- * - Atomically increments credits (idempotent by purchaseToken)
  */
 app.post("/verify-purchase", async (req, res) => {
   try {
@@ -496,7 +564,6 @@ app.post("/verify-purchase", async (req, res) => {
 
     const androidpublisher = await getAndroidPublisherClient();
 
-    // 1) Verify purchase
     const getResp = await androidpublisher.purchases.products.get({
       packageName: GOOGLE_PLAY_PACKAGE_NAME,
       productId,
@@ -504,25 +571,18 @@ app.post("/verify-purchase", async (req, res) => {
     });
 
     const p = getResp.data || {};
-
-    // purchaseState: 0 Purchased, 1 Canceled, 2 Pending
     const purchaseState = Number(p.purchaseState);
     if (purchaseState !== 0) {
-      return res.status(402).json({
-        error: "PURCHASE_NOT_COMPLETED",
-        purchaseState,
-      });
+      return res.status(402).json({ error: "PURCHASE_NOT_COMPLETED", purchaseState });
     }
 
-    // 2) Consume for topup products
     await androidpublisher.purchases.products.consume({
       packageName: GOOGLE_PLAY_PACKAGE_NAME,
       productId,
       token: purchaseToken,
     });
 
-    // 3) Atomically add credits if purchaseToken not used
-    const ttlSeconds = 60 * 60 * 24 * 365; // 1 year idempotency
+    const ttlSeconds = 60 * 60 * 24 * 365;
     const pKey = purchaseKey(purchaseToken);
     const cKey = creditsKey(userId);
 
@@ -548,9 +608,7 @@ app.post("/verify-purchase", async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    return res
-      .status(500)
-      .json({ error: err.message || "VERIFY_ERROR" });
+    return res.status(500).json({ error: err.message || "VERIFY_ERROR" });
   }
 });
 
